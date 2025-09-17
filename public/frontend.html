@@ -1,0 +1,484 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Prayer Tracker — Checklist (Time-aware)</title>
+
+    <!-- Bootstrap CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background:#f7f9fc; padding:18px; }
+        .prayer-name { text-transform: capitalize; font-weight:600; }
+        .small-muted { font-size:.85rem; color:#6c757d; }
+        .badge-late { background:#ff9800; color:#fff; }
+        .badge-missed { background:#dc3545; color:#fff; }
+        .badge-on { background:#198754; color:#fff; }
+        .badge-pending { background:#6c757d; color:#fff; }
+        pre.debug { max-height:120px; overflow:auto; background:#fff; padding:8px; border-radius:6px; }
+        .group-item { cursor: pointer; }
+        .group-item:hover { background-color: #f0f0f0; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="d-flex justify-content-between align-items-center mb-3">
+        <h3>Prayer Tracker</h3>
+        <div>
+            <span id="userInfo" class="me-3 small-muted">Checking session…</span>
+            <button id="loginBtn" class="btn btn-sm btn-outline-primary">Login with Google</button>
+            <button id="logoutBtn" class="btn btn-sm btn-outline-secondary" style="display:none;">Logout</button>
+        </div>
+    </div>
+
+    <div id="app" style="display:none;">
+        <div class="row g-3">
+            <div class="col-md-5">
+                <div class="card shadow-sm">
+                    <div class="card-body">
+                        <div class="d-flex justify-content-between">
+                            <div>
+                                <h5 class="mb-0">Today's Checklist</h5>
+                                <div id="dateInfo" class="small-muted">—</div>
+                            </div>
+                            <div class="text-end small-muted" id="timesSummary">Times not loaded</div>
+                        </div>
+
+                        <div id="prayerList" class="list-group my-3">
+                            <!-- rows inserted here -->
+                        </div>
+
+                        <div class="d-flex gap-2">
+                            <button id="saveTimesBtn" class="btn btn-sm btn-success">Save/Update Times</button>
+                            <button id="refreshBtn" class="btn btn-sm btn-outline-secondary">Refresh</button>
+                        </div>
+
+                        <div id="mainAlert" class="mt-2"></div>
+                    </div>
+                </div>
+
+                <div class="card mt-3 shadow-sm">
+                    <div class="card-body">
+                        <h6 class="card-title small-muted mb-2">Debug</h6>
+                        <pre id="debug" class="debug"></pre>
+                    </div>
+                </div>
+            </div>
+
+            <div class="col-md-7">
+                <div class="card shadow-sm">
+                    <div class="card-body">
+                        <h5 class="mb-3">History (last 7 days)</h5>
+                        <div id="history" style="max-height:200px; overflow:auto;"></div>
+                    </div>
+                </div>
+                <div class="card shadow-sm mt-3">
+                    <div class="card-body">
+                        <h5 class="mb-3">Groups</h5>
+                        <div id="groupsList"></div>
+                        <div class="input-group mt-3">
+                            <input type="text" id="groupName" class="form-control" placeholder="New group name">
+                            <button id="createGroupBtn" class="btn btn-primary">Create</button>
+                        </div>
+                        <div id="groupDetails" class="mt-3"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="notLogged" class="alert alert-warning" style="display:none;">
+        You are not logged in. Please sign in with Google to use the tracker.
+        <div class="mt-2"><button id="loginBtn2" class="btn btn-primary btn-sm">Login with Google</button></div>
+    </div>
+</div>
+
+<script>
+    /* ---------- helpers ---------- */
+    const apiBase = '';
+    let currentUser = null;
+    let scheduledTimes = null; // object with fajr/shurooq/dhuhr/asr/maghrib/isha (24hr strings)
+    const prayersOrder = ['fajr','shurooq','dhuhr','asr','maghrib','isha'];
+
+    // format "18:58:00" -> "6:58 PM"
+    function to12Hour(timeStr) {
+        if (!timeStr) return '-';
+        const [hh, mm] = timeStr.split(':').map(Number);
+        const ampm = hh >= 12 ? 'PM' : 'AM';
+        const h12 = (hh % 12) || 12;
+        return `${h12}:${String(mm).padStart(2,'0')} ${ampm}`;
+    }
+
+    function showDebug(x){ try { document.getElementById('debug').textContent = (typeof x === 'string')? x : JSON.stringify(x,null,2); } catch(e){} }
+    function flash(msg, type='info') {
+        const container = document.getElementById('mainAlert');
+        container.innerHTML = `<div class="alert alert-${type} py-2">${msg}</div>`;
+        setTimeout(()=>{ container.innerHTML = ''; }, 3500);
+    }
+
+    async function apiFetch(url, opts={}) {
+        opts.credentials = 'include';
+        const res = await fetch(apiBase + url, opts);
+        const text = await res.text();
+        let json = null;
+        try { json = text ? JSON.parse(text) : null; } catch(e){ json = text; }
+        if (!res.ok) {
+            const err = new Error('HTTP ' + res.status);
+            err.status = res.status;
+            err.body = json;
+            throw err;
+        }
+        return json;
+    }
+
+    // *** NEW FUNCTION ***
+    // This function asks the browser for its location and wraps the result in a Promise
+    function getUserLocation() {
+        return new Promise((resolve, reject) => {
+            if (!navigator.geolocation) {
+                return reject(new Error('Geolocation is not supported by your browser.'));
+            }
+            navigator.geolocation.getCurrentPosition(
+                (position) => {
+                    resolve({
+                        lat: position.coords.latitude,
+                        lon: position.coords.longitude
+                    });
+                },
+                (err) => {
+                    // This error occurs if the user clicks "Block"
+                    reject(new Error(`Geolocation error: ${err.message}`));
+                }
+            );
+        });
+    }
+
+
+    /* ---------- auth & startup ---------- */
+    document.getElementById('loginBtn').onclick = () => { window.location.href = '/auth/google'; };
+    const lb2 = document.getElementById('loginBtn2');
+    if (lb2) lb2.onclick = () => { window.location.href = '/auth/google'; };
+    document.getElementById('logoutBtn').onclick = () => { window.location.href = '/logout'; };
+
+    async function checkUser() {
+        try {
+            const me = await apiFetch('/api/me');
+            if (me && me.loggedIn) {
+                currentUser = me;
+                document.getElementById('userInfo').textContent = `Signed in: ${me.name || me.username}`;
+                document.getElementById('loginBtn').style.display = 'none';
+                document.getElementById('logoutBtn').style.display = 'inline-block';
+                document.getElementById('app').style.display = 'block';
+                document.getElementById('notLogged').style.display = 'none';
+
+                await ensurePrayerTimesForToday();
+                await loadChecklist();
+                await loadHistory();
+                await loadGroups();
+                setInterval(updateEnableStates, 30*1000);
+            } else {
+                currentUser = null;
+                document.getElementById('userInfo').textContent = 'Not signed in';
+                document.getElementById('loginBtn').style.display = 'inline-block';
+                document.getElementById('logoutBtn').style.display = 'none';
+                document.getElementById('app').style.display = 'none';
+                document.getElementById('notLogged').style.display = 'block';
+            }
+        } catch (err) {
+            console.error('checkUser error', err);
+            showDebug(err.body || err.message || err);
+            flash('Failed to get session', 'danger');
+        }
+    }
+
+    // *** REFACTORED AND FIXED FUNCTION ***
+    async function savePrayerTimes() {
+        if (!currentUser) return alert('Login first');
+
+        try {
+            flash('Getting your location...', 'info');
+            const location = await getUserLocation(); // Ask browser for location
+            flash('Location found! Saving times...', 'info');
+            showDebug({location});
+
+            // Send location to server so it can calculate and save times
+            const body = {
+                userId: currentUser.id,
+                lat: location.lat,
+                lon: location.lon
+            };
+
+            const res = await apiFetch('/prayer-times/save', {
+                method:'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(body)
+            });
+
+            flash('Saved prayer times!', 'success');
+            // update scheduledTimes and reload checklist
+            const date = res.date || new Date().toISOString().slice(0,10);
+            const times = await apiFetch(`/prayer-times/${encodeURIComponent(currentUser.id)}/${encodeURIComponent(date)}`);
+            scheduledTimes = times;
+            updateTimesSummary(times);
+            await loadChecklist();
+
+        } catch (err) {
+            console.error('savePrayerTimes error:', err);
+            // This is where the error from blocking geolocation will be caught
+            showDebug(err.body || err.message);
+            flash('Failed to save times: ' + (err.body?.error || err.message), 'danger');
+        }
+    }
+
+
+    /* ---------- ensure prayer times ---------- */
+    async function ensurePrayerTimesForToday() {
+        if (!currentUser) return;
+        const date = new Date().toISOString().slice(0,10);
+        try {
+            const times = await apiFetch(`/prayer-times/${encodeURIComponent(currentUser.id)}/${encodeURIComponent(date)}`);
+            scheduledTimes = times;
+            updateTimesSummary(times);
+        } catch (err) {
+            if (err.status === 404) {
+                // If missing (404) -> attempt to create them by calling our new save function
+                showDebug('No saved times — attempting to save now...');
+                await savePrayerTimes();
+            } else {
+                console.error('ensurePrayerTimes error', err);
+                showDebug(err.body || err.message || err);
+                flash('Failed to load prayer times', 'danger');
+            }
+        }
+    }
+
+    function updateTimesSummary(times) {
+        if (!times) return;
+        const s = prayersOrder.map(p => `${p}: ${to12Hour(times[p] || times[p])}`).join(' | ');
+        document.getElementById('timesSummary').textContent = s;
+        document.getElementById('dateInfo').textContent = times.date || new Date().toISOString().slice(0,10);
+    }
+
+    /* ---------- checklist UI ---------- */
+    async function loadChecklist() {
+        if (!currentUser) return;
+        const list = document.getElementById('prayerList');
+        list.innerHTML = '<div class="p-3 text-center text-muted">Loading checklist…</div>';
+        try {
+            const res = await apiFetch(`/prayers/today/${encodeURIComponent(currentUser.id)}`);
+
+            const times = scheduledTimes || {};
+
+            const rows = (res.checklist || []).map(item => {
+                const status = item.status || (item.done ? 'on_time' : 'pending');
+                const scheduled = times[item.prayer_name] || null;
+                const scheduledDisplay = scheduled ? to12Hour(scheduled) : '-';
+                const doneAt = item.done_at ? new Date(item.done_at).toLocaleTimeString() : '';
+                let badgeHtml = `<span class="badge badge-pending">Pending</span>`;
+                if (status === 'on_time') badgeHtml = `<span class="badge badge-on">On time</span>`;
+                if (status === 'late') badgeHtml = `<span class="badge badge-late">Late</span>`;
+                if (status === 'not_done') badgeHtml = `<span class="badge badge-missed">Missed</span>`;
+                const disabledAttr = (status !== 'pending') ? 'disabled' : '';
+
+                return `
+        <div class="list-group-item d-flex justify-content-between align-items-center" data-prayer="${item.prayer_name}">
+          <div>
+            <div class="prayer-name">${item.prayer_name}</div>
+            <div class="small-muted">Time: ${scheduledDisplay} ${doneAt ? '| Done at: ' + doneAt : ''}</div>
+          </div>
+          <div class="text-end">
+            <div class="mb-1">${badgeHtml}</div>
+            <button class="btn btn-sm btn-primary mark-btn" ${disabledAttr}>Mark</button>
+          </div>
+        </div>`;
+            }).join('');
+
+            list.innerHTML = rows || '<div class="p-2 text-muted">No checklist yet</div>';
+            document.querySelectorAll('.mark-btn').forEach(b => {
+                b.onclick = async (ev) => {
+                    const row = ev.target.closest('.list-group-item');
+                    await markPrayer(row.dataset.prayer, ev.target);
+                };
+            });
+            updateEnableStates();
+        } catch (err) {
+            console.error('loadChecklist error', err);
+            list.innerHTML = `<div class="p-2 text-danger">Failed to load checklist: ${err.body?.error || err.message}</div>`;
+            showDebug(err.body || err.message);
+        }
+    }
+
+    function updateEnableStates() {
+        if (!scheduledTimes) return;
+        const date = new Date().toISOString().slice(0,10);
+        const now = new Date();
+        document.querySelectorAll('#prayerList .list-group-item').forEach(row => {
+            const prayer = row.dataset.prayer;
+            const btn = row.querySelector('.mark-btn');
+            const badge = row.querySelector('.badge');
+            const timeStr = scheduledTimes[prayer];
+            if (!timeStr) {
+                if (btn) btn.disabled = true;
+                return;
+            }
+            const scheduled = new Date(`${date}T${timeStr}`);
+            const statusText = badge ? badge.textContent.trim().toLowerCase() : '';
+            if (statusText !== 'pending') {
+                if (btn) btn.disabled = true;
+                return;
+            }
+            if (btn) btn.disabled = (now < scheduled);
+        });
+    }
+
+    /* ---------- mark prayer ---------- */
+    async function markPrayer(prayerName, btnEl) {
+        if (!currentUser) return;
+        btnEl.disabled = true;
+        btnEl.innerHTML = 'Marking…';
+        try {
+            const payload = { userId: Number(currentUser.id), prayerName };
+            const res = await apiFetch('/prayers/mark', {
+                method: 'POST',
+                headers: {'Content-Type':'application/json'},
+                body: JSON.stringify(payload)
+            });
+            flash(`Marked ${prayerName} (${res.status})`, 'success');
+            await loadChecklist();
+            await loadHistory();
+        } catch (err) {
+            console.error('mark error', err);
+            showDebug(err.body || err.message);
+            flash(err.body?.error || err.message || 'Failed to mark', 'danger');
+            setTimeout(() => {
+                const currentBtn = document.querySelector(`.list-group-item[data-prayer="${prayerName}"] .mark-btn`);
+                if (currentBtn && currentBtn.disabled) {}
+                else if (currentBtn) {
+                    currentBtn.disabled = false;
+                    currentBtn.innerHTML = "Mark";
+                }
+            }, 600);
+        }
+    }
+
+    /* ---------- history ---------- */
+    async function loadHistory() {
+        if (!currentUser) return;
+        const el = document.getElementById('history');
+        el.innerHTML = '<div class="p-2 text-muted">Loading history…</div>';
+        try {
+            const res = await apiFetch(`/api/history/${encodeURIComponent(currentUser.id)}`);
+            const rows = res.history || [];
+            if (!rows.length) { el.innerHTML = '<div class="p-2 text-muted">No recent history</div>'; return; }
+            el.innerHTML = rows.map(r => {
+                const status = r.status || r.action || '';
+                const cls = (status === 'not_done') ? 'text-danger' : (status === 'late' ? 'text-warning' : 'text-success');
+                const formattedTimestamp = new Date(r.timestamp).toLocaleString();
+                return `<div class="d-flex justify-content-between border-bottom p-2">
+                <div><strong>${r.prayer_name}</strong> <div class="small-muted">${status}</div></div>
+                <div class="${cls} small-muted">${formattedTimestamp}</div>
+              </div>`;
+            }).join('');
+        } catch (err) {
+            console.error('loadHistory', err);
+            el.innerHTML = `<div class="p-2 text-danger">History error: ${err.body?.error || err.message}</div>`;
+        }
+    }
+
+    /* ---------- groups ---------- */
+    async function loadGroups() {
+        if (!currentUser) return;
+        const el = document.getElementById('groupsList');
+        el.innerHTML = '<div class="p-2 text-muted">Loading groups…</div>';
+        try {
+            const groups = await apiFetch('/api/groups');
+            if (!groups.length) {
+                el.innerHTML = '<div class="p-2 text-muted">No groups yet</div>';
+                return;
+            }
+            el.innerHTML = groups.map(g => `<div class="p-2 border-bottom group-item" data-group-id="${g.id}">${g.name}</div>`).join('');
+            document.querySelectorAll('.group-item').forEach(item => {
+                item.onclick = async (ev) => {
+                    await loadGroupDetails(ev.target.dataset.groupId, ev.target.textContent);
+                };
+            });
+        } catch (err) {
+            console.error('loadGroups error', err);
+            el.innerHTML = `<div class="p-2 text-danger">Groups error: ${err.body?.error || err.message}</div>`;
+        }
+    }
+
+    async function loadGroupDetails(groupId, groupName) {
+        const el = document.getElementById('groupDetails');
+        el.innerHTML = `<h6>Loading "${groupName}" details...</h6>`;
+        try {
+            const groupData = await apiFetch(`/api/groups/${groupId}`);
+            const { members, prayerStatus } = groupData;
+            let html = `<h6>${groupName} - Today's Status</h6><ul class="list-group">`;
+            members.forEach(member => {
+                html += `<li class="list-group-item"><strong>${member.name || 'Unnamed User'}</strong><div class="d-flex flex-wrap gap-2 mt-1">`;
+                const memberPrayers = prayerStatus.filter(p => p.user_id === member.id);
+                prayersOrder.forEach(prayerName => {
+                    const prayer = memberPrayers.find(p => p.prayer_name === prayerName);
+                    const status = prayer ? prayer.status : 'pending';
+                    let badgeClass = 'badge-pending';
+                    if (status === 'on_time') badgeClass = 'badge-on';
+                    if (status === 'late') badgeClass = 'badge-late';
+                    if (status === 'not_done') badgeClass = 'badge-missed';
+                    html += `<span class="badge ${badgeClass} text-capitalize">${prayerName}</span>`;
+                });
+                html += `</div></li>`;
+            });
+            html += '</ul>';
+            el.innerHTML = html;
+        } catch(err) {
+            console.error('loadGroupDetails error', err);
+            el.innerHTML = `<div class="alert alert-danger">Could not load group details. ${err.body?.error || ''}</div>`;
+        }
+    }
+
+    document.getElementById('createGroupBtn').onclick = async () => {
+        const groupNameInput = document.getElementById('groupName');
+        const groupName = groupNameInput.value.trim();
+        if (!groupName) return;
+        try {
+            await apiFetch('/api/groups', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: groupName })
+            });
+            groupNameInput.value = '';
+            await loadGroups();
+        } catch (err) {
+            console.error('createGroup error', err);
+            flash(err.body?.error || 'Failed to create group', 'danger');
+        }
+    };
+
+    /* ---------- bindings ---------- */
+    document.getElementById('saveTimesBtn').onclick = async () => {
+        const btn = document.getElementById('saveTimesBtn');
+        btn.disabled = true;
+        const originalText = btn.textContent;
+        btn.textContent = 'Saving…';
+
+        await savePrayerTimes(); // This now contains the full logic with location fetching
+
+        btn.disabled = false;
+        btn.textContent = originalText;
+    };
+
+    document.getElementById('refreshBtn').onclick = () => {
+        flash('Refreshing...');
+        loadChecklist();
+        loadHistory();
+        loadGroups();
+        document.getElementById('groupDetails').innerHTML = '';
+    };
+
+    /* ---------- init ---------- */
+    checkUser();
+
+</script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+{
+  "dependencies": {
+    "adhan": "^4.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.2",
+    "express": "^5.1.0",
+    "express-session": "^1.18.2",
+    "geolocator": "^2.1.5",
+    "node-cron": "^4.2.1",
+    "node-fetch": "^3.3.2",
+    "passport": "^0.7.0",
+    "passport-google-oauth20": "^2.0.0",
+    "sqlite3": "^5.1.7"
+  }
+}
